@@ -1,0 +1,76 @@
+# Render Blueprint - Infrastructure as Code
+# Deploy both services with: Connect repo -> Select "render.yaml"
+
+services:
+  # ===================
+  # BACKEND - Web Service
+  # ===================
+  - type: web
+    name: pcs-assistant-api
+    runtime: python
+    region: frankfurt
+    plan: free
+
+    # Build Configuration
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    # Health Check
+    healthCheckPath: /health
+
+    # Environment Variables
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: ANTHROPIC_API_KEY
+        sync: false  # Manual input required in Render Dashboard
+      - key: ALLOWED_ORIGINS
+        value: https://pcs-assistant.onrender.com,http://localhost:5173
+      - key: DEBUG
+        value: "false"
+      - key: CACHE_TTL_DEFAULT
+        value: "300"
+      - key: CACHE_TTL_RANKINGS
+        value: "600"
+
+    # Auto-deploy on push to main
+    autoDeploy: true
+
+  # ===================
+  # FRONTEND - Static Site
+  # ===================
+  - type: web
+    name: pcs-assistant
+    runtime: static
+    region: frankfurt
+    plan: free
+
+    # Build Configuration
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+
+    # Environment Variables (Build-time)
+    envVars:
+      - key: VITE_API_URL
+        value: https://pcs-assistant-api.onrender.com
+      - key: VITE_WS_URL
+        value: wss://pcs-assistant-api.onrender.com/ws/live
+
+    # SPA Routing - Redirect all paths to index.html
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+    # Headers for security and caching
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+
+    autoDeploy: true
