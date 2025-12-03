@@ -1,5 +1,7 @@
 """
-AI Service for natural language processing using Claude API.
+AI Service for natural language processing.
+
+Supports both OpenAI and Anthropic APIs based on configuration.
 
 Handles:
 - Intent classification
@@ -7,17 +9,16 @@ Handles:
 - Natural language response generation
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 import json
-
-from anthropic import Anthropic
+import re
 
 from app.config import settings
 from app.services.pcs_scraper import PCSScraperService
 
 
 class AIService:
-    """Claude AI integration for natural language cycling queries."""
+    """AI integration for natural language cycling queries."""
 
     SYSTEM_PROMPT = """You are PCS Assistant, an expert AI assistant for professional cycling statistics.
 You have access to real-time data from ProCyclingStats.com.
@@ -84,9 +85,45 @@ Common race slugs:
 Only return valid JSON, no explanation."""
 
     def __init__(self, scraper: PCSScraperService):
-        self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         self.scraper = scraper
-        self.model = "claude-sonnet-4-20250514"
+        self.model = settings.AI_MODEL
+        self.is_anthropic = self.model.startswith("claude")
+
+        # Initialize the appropriate client
+        if self.is_anthropic:
+            from anthropic import Anthropic
+            self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        else:
+            from openai import OpenAI
+            self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+    def _call_llm(self, messages: list, max_tokens: int = 1000, system: str = None) -> str:
+        """Call the LLM with the appropriate API format."""
+        if self.is_anthropic:
+            # Anthropic API format
+            kwargs = {
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "messages": messages
+            }
+            if system:
+                kwargs["system"] = system
+
+            response = self.client.messages.create(**kwargs)
+            return response.content[0].text
+        else:
+            # OpenAI API format
+            openai_messages = []
+            if system:
+                openai_messages.append({"role": "system", "content": system})
+            openai_messages.extend(messages)
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                messages=openai_messages
+            )
+            return response.choices[0].message.content
 
     async def plan_query(self, question: str) -> Dict[str, Any]:
         """
@@ -95,26 +132,19 @@ Only return valid JSON, no explanation."""
         Returns structured plan for data fetching.
         """
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=1000,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": self.QUERY_PLANNING_PROMPT.format(question=question)
-                    }
-                ]
-            )
-
-            # Extract JSON from response
-            response_text = response.content[0].text.strip()
+            response_text = self._call_llm(
+                messages=[{
+                    "role": "user",
+                    "content": self.QUERY_PLANNING_PROMPT.format(question=question)
+                }],
+                max_tokens=1000
+            ).strip()
 
             # Try to find JSON in the response
             if response_text.startswith("{"):
                 plan = json.loads(response_text)
             else:
                 # Try to extract JSON from markdown code block
-                import re
                 json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
                 if json_match:
                     plan = json.loads(json_match.group(1))
@@ -134,9 +164,7 @@ Only return valid JSON, no explanation."""
             }
 
     async def execute_query(self, plan: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute the query plan and fetch required data.
-        """
+        """Execute the query plan and fetch required data."""
         intent = plan.get("intent", "general")
         entities = plan.get("entities", {})
         filters = plan.get("filters", {})
@@ -145,7 +173,7 @@ Only return valid JSON, no explanation."""
 
         try:
             if intent == "rider_info" and entities.get("riders"):
-                for rider_slug in entities["riders"][:3]:  # Limit to 3 riders
+                for rider_slug in entities["riders"][:3]:
                     rider_data = await self.scraper.get_rider(rider_slug)
                     data[rider_slug] = rider_data
 
@@ -195,21 +223,14 @@ Only return valid JSON, no explanation."""
         data: Dict[str, Any],
         plan: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """
-        Generate natural language response with optional visualization data.
-        """
-        # Build context from fetched data
+        """Generate natural language response with optional visualization data."""
         data_context = json.dumps(data, indent=2, default=str)
 
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=2000,
-                system=self.SYSTEM_PROMPT,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"""Question: {question}
+            response_text = self._call_llm(
+                messages=[{
+                    "role": "user",
+                    "content": f"""Question: {question}
 
 Data fetched from ProCyclingStats:
 ```json
@@ -220,23 +241,20 @@ Query plan: {json.dumps(plan)}
 
 Provide a helpful response based on this data. Be concise and informative.
 If there's an error in the data, explain what went wrong."""
-                    }
-                ]
+                }],
+                max_tokens=2000,
+                system=self.SYSTEM_PROMPT
             )
-
-            response_text = response.content[0].text
 
         except Exception as e:
             response_text = f"Mi dispiace, si è verificato un errore: {str(e)}"
 
-        # Build response object
         result = {
             "message": response_text,
             "data": data,
             "visualization": None
         }
 
-        # Add visualization data if appropriate
         if plan.get("visualization") != "none" and not data.get("error"):
             viz_data = self._prepare_chart_data(data, plan)
             if viz_data:
@@ -261,7 +279,6 @@ If there's an error in the data, explain what went wrong."""
 
         try:
             if viz_type == "bar_chart" and intent in ["rider_victories", "rider_info"]:
-                # Format for victories bar chart
                 chart_data = []
                 for rider, rider_data in data.items():
                     if isinstance(rider_data, dict) and "error" not in rider_data:
@@ -280,7 +297,6 @@ If there's an error in the data, explain what went wrong."""
                     return {"series": chart_data, "xKey": "name", "yKey": "victories"}
 
             elif viz_type == "radar_chart" and intent == "comparison":
-                # Format for rider comparison radar
                 chart_data = []
                 for rider, rider_data in data.items():
                     if isinstance(rider_data, dict) and "error" not in rider_data:
@@ -298,7 +314,6 @@ If there's an error in the data, explain what went wrong."""
                     return {"series": chart_data}
 
             elif viz_type == "table" and intent == "ranking":
-                # Format for ranking table
                 ranking = data.get("ranking", {})
                 if isinstance(ranking, dict):
                     ranking = ranking.get("ranking", [])
@@ -316,13 +331,7 @@ If there's an error in the data, explain what went wrong."""
 
         Orchestrates: plan -> fetch -> respond
         """
-        # 1. Plan the query
         plan = await self.plan_query(question)
-
-        # 2. Execute and fetch data
         data = await self.execute_query(plan)
-
-        # 3. Generate response
         response = await self.generate_response(question, data, plan)
-
         return response

@@ -22,7 +22,9 @@ class Settings(BaseSettings):
         "http://localhost:3000"
     ]
 
-    # Claude API
+    # AI Configuration - supports both OpenAI and Anthropic
+    AI_MODEL: str = "gpt-4o"  # e.g., "gpt-4o", "gpt-3.5-turbo", "claude-sonnet-4-20250514"
+    OPENAI_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
 
     # Cache
